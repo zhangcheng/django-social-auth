@@ -78,6 +78,7 @@ AUTHENTICATION_BACKENDS = (
     'social_auth.backends.contrib.flickr.FlickrBackend',
     'social_auth.backends.contrib.instagram.InstagramBackend',
     'social_auth.backends.contrib.douban.DoubanBackend',
+    'social_auth.backends.contrib.tencent.TencentBackend',
     'social_auth.backends.OpenIDBackend',
     'social_auth.backends.contrib.livejournal.LiveJournalBackend',
     'social_auth.backends.browserid.BrowserIDBackend',
