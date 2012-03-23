@@ -9,3 +9,4 @@ Add support for China social networks. Currently support:
 * 腾讯微博(http://t.qq.com)
 * 新浪微博(http://weibo.com)
 * 人人网(http://renren.com)
+* 淘宝网(http://taobao.com)
