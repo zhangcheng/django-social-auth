@@ -6,8 +6,7 @@ No extra configurations are needed to make this work.
 from xml.etree import ElementTree
 from xml.parsers.expat import ExpatError
 
-from django.conf import settings
-
+from social_auth.utils import setting
 from social_auth.backends import ConsumerBasedOAuth, OAuthBackend, USERNAME
 
 
@@ -54,8 +53,7 @@ class LinkedinAuth(ConsumerBasedOAuth):
     def user_data(self, access_token):
         """Return user data provided"""
         fields_selectors = LINKEDIN_FIELD_SELECTORS + \
-                           getattr(settings, 'LINKEDIN_EXTRA_FIELD_SELECTORS',
-                                   [])
+                           setting('LINKEDIN_EXTRA_FIELD_SELECTORS', [])
         url = LINKEDIN_CHECK_AUTH + ':(%s)' % ','.join(fields_selectors)
         request = self.oauth_request(access_token, url)
         raw_xml = self.fetch_response(request)

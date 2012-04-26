@@ -16,18 +16,21 @@ OpenID also works straightforward, it doesn't need further configurations.
 from urllib import urlencode
 from urllib2 import Request, urlopen
 
-from django.conf import settings
+from oauth2 import Request as OAuthRequest
+
 from django.utils import simplejson
 
+from social_auth.utils import setting
 from social_auth.backends import OpenIdAuth, ConsumerBasedOAuth, BaseOAuth2, \
                                  OAuthBackend, OpenIDBackend, USERNAME
+from social_auth.backends.exceptions import AuthFailed
 
 
 # Google OAuth base configuration
 GOOGLE_OAUTH_SERVER = 'www.google.com'
-GOOGLE_OAUTH_AUTHORIZATION_URL = 'https://www.google.com/accounts/OAuthAuthorizeToken'
-GOOGLE_OAUTH_REQUEST_TOKEN_URL = 'https://www.google.com/accounts/OAuthGetRequestToken'
-GOOGLE_OAUTH_ACCESS_TOKEN_URL = 'https://www.google.com/accounts/OAuthGetAccessToken'
+AUTHORIZATION_URL = 'https://www.google.com/accounts/OAuthAuthorizeToken'
+REQUEST_TOKEN_URL = 'https://www.google.com/accounts/OAuthGetRequestToken'
+ACCESS_TOKEN_URL = 'https://www.google.com/accounts/OAuthGetAccessToken'
 
 # Google OAuth2 base configuration
 GOOGLE_OAUTH2_SERVER = 'accounts.google.com'
@@ -36,10 +39,11 @@ GOOGLE_OATUH2_AUTHORIZATION_URL = 'https://accounts.google.com/o/oauth2/auth'
 # scope for user email, specify extra scopes in settings, for example:
 # GOOGLE_OAUTH_EXTRA_SCOPE = ['https://www.google.com/m8/feeds/']
 GOOGLE_OAUTH_SCOPE = ['https://www.googleapis.com/auth/userinfo#email']
+GOOGLE_OAUTH2_SCOPE = ['https://www.googleapis.com/auth/userinfo.email',
+                       'https://www.googleapis.com/auth/userinfo.profile']
 GOOGLEAPIS_EMAIL = 'https://www.googleapis.com/userinfo/email'
+GOOGLEAPIS_PROFILE = 'https://www.googleapis.com/oauth2/v1/userinfo'
 GOOGLE_OPENID_URL = 'https://www.google.com/accounts/o8/id'
-
-EXPIRES_NAME = getattr(settings, 'SOCIAL_AUTH_EXPIRATION', 'expires')
 
 
 # Backends
@@ -49,6 +53,7 @@ class GoogleOAuthBackend(OAuthBackend):
 
     def get_user_id(self, details, response):
         "Use google email as unique id"""
+        validate_whitelists(self, details['email'])
         return details['email']
 
     def get_user_details(self, response):
@@ -64,13 +69,33 @@ class GoogleOAuthBackend(OAuthBackend):
 class GoogleOAuth2Backend(GoogleOAuthBackend):
     """Google OAuth2 authentication backend"""
     name = 'google-oauth2'
-    EXTRA_DATA = [('refresh_token', 'refresh_token'),
-                  ('expires_in', EXPIRES_NAME)]
+    EXTRA_DATA = [
+        ('refresh_token', 'refresh_token'),
+        ('expires_in', setting('SOCIAL_AUTH_EXPIRATION', 'expires'))
+    ]
+
+    def get_user_details(self, response):
+        email = response['email']
+        return {USERNAME: email.split('@', 1)[0],
+                'email': email,
+                'fullname': response.get('name', ''),
+                'first_name': response.get('given_name', ''),
+                'last_name': response.get('family_name', '')}
 
 
 class GoogleBackend(OpenIDBackend):
     """Google OpenID authentication backend"""
     name = 'google'
+
+    def get_user_id(self, details, response):
+        """
+        Return user unique id provided by service. For google user email
+        is unique enought to flag a single user. Email comes from schema:
+        http://axschema.org/contact/email
+        """
+        validate_whitelists(self, details['email'])
+
+        return details['email']
 
 
 # Auth classes
@@ -85,9 +110,9 @@ class GoogleAuth(OpenIdAuth):
 
 class BaseGoogleOAuth(ConsumerBasedOAuth):
     """Base class for Google OAuth mechanism"""
-    AUTHORIZATION_URL = GOOGLE_OAUTH_AUTHORIZATION_URL
-    REQUEST_TOKEN_URL = GOOGLE_OAUTH_REQUEST_TOKEN_URL
-    ACCESS_TOKEN_URL = GOOGLE_OAUTH_ACCESS_TOKEN_URL
+    AUTHORIZATION_URL = AUTHORIZATION_URL
+    REQUEST_TOKEN_URL = REQUEST_TOKEN_URL
+    ACCESS_TOKEN_URL = ACCESS_TOKEN_URL
     SERVER_URL = GOOGLE_OAUTH_SERVER
 
     def user_data(self, access_token):
@@ -108,15 +133,21 @@ class GoogleOAuth(BaseGoogleOAuth):
         url, params = request.to_url().split('?', 1)
         return googleapis_email(url, params)
 
+    def oauth_authorization_request(self, token):
+        """Generate OAuth request to authorize token."""
+        return OAuthRequest.from_consumer_and_token(self.consumer,
+                    token=token,
+                    http_url=self.AUTHORIZATION_URL)
+
     def oauth_request(self, token, url, extra_params=None):
         extra_params = extra_params or {}
-        scope = GOOGLE_OAUTH_SCOPE + \
-                getattr(settings, 'GOOGLE_OAUTH_EXTRA_SCOPE', [])
+        scope = GOOGLE_OAUTH_SCOPE + setting('GOOGLE_OAUTH_EXTRA_SCOPE', [])
         extra_params.update({
             'scope': ' '.join(scope),
-            'xoauth_displayname': getattr(settings, 'GOOGLE_DISPLAY_NAME',
-                                          'Social Auth')
         })
+        if not self.registered():
+            xoauth_displayname = setting('GOOGLE_DISPLAY_NAME', 'Social Auth')
+            extra_params['xoauth_displayname'] = xoauth_displayname
         return super(GoogleOAuth, self).oauth_request(token, url, extra_params)
 
     def get_key_and_secret(self):
@@ -135,23 +166,31 @@ class GoogleOAuth(BaseGoogleOAuth):
         """Google OAuth is always enabled because of anonymous access"""
         return True
 
+    def registered(self):
+        """Check if Google OAuth Consumer Key and Consumer Secret are set"""
+        return self.get_key_and_secret() != ('anonymous', 'anonymous')
+
+
+# TODO: Remove this setting name check, keep for backward compatibility
+_OAUTH2_KEY_NAME = setting('GOOGLE_OAUTH2_CLIENT_ID') and \
+                   'GOOGLE_OAUTH2_CLIENT_ID' or \
+                   'GOOGLE_OAUTH2_CLIENT_KEY'
+
 
 class GoogleOAuth2(BaseOAuth2):
     """Google OAuth2 support"""
     AUTH_BACKEND = GoogleOAuth2Backend
     AUTHORIZATION_URL = 'https://accounts.google.com/o/oauth2/auth'
     ACCESS_TOKEN_URL = 'https://accounts.google.com/o/oauth2/token'
-    SETTINGS_KEY_NAME = 'GOOGLE_OAUTH2_CLIENT_KEY'
+    SETTINGS_KEY_NAME = _OAUTH2_KEY_NAME
     SETTINGS_SECRET_NAME = 'GOOGLE_OAUTH2_CLIENT_SECRET'
 
     def get_scope(self):
-        return GOOGLE_OAUTH_SCOPE + \
-               getattr(settings, 'GOOGLE_OAUTH_EXTRA_SCOPE', [])
+        return GOOGLE_OAUTH2_SCOPE + setting('GOOGLE_OAUTH_EXTRA_SCOPE', [])
 
     def user_data(self, access_token):
         """Return user data from Google API"""
-        data = {'oauth_token': access_token, 'alt': 'json'}
-        return googleapis_email(GOOGLEAPIS_EMAIL, urlencode(data))
+        return googleapis_profile(GOOGLEAPIS_PROFILE, access_token)
 
 
 def googleapis_email(url, params):
@@ -160,15 +199,44 @@ def googleapis_email(url, params):
 
     Parameters must be passed in queryset and Authorization header as described
     on Google OAuth documentation at:
-        http://groups.google.com/group/oauth/browse_thread/thread/d15add9beb418ebc
-    and:
-        http://code.google.com/apis/accounts/docs/OAuth2.html#CallingAnAPI
+    http://groups.google.com/group/oauth/browse_thread/thread/d15add9beb418ebc
+    and: http://code.google.com/apis/accounts/docs/OAuth2.html#CallingAnAPI
     """
     request = Request(url + '?' + params, headers={'Authorization': params})
     try:
         return simplejson.loads(urlopen(request).read())['data']
     except (ValueError, KeyError, IOError):
         return None
+
+
+def googleapis_profile(url, access_token):
+    """
+    Loads user data from googleapis service, such as name, given_name,
+    family_name, etc. as it's described in:
+    https://developers.google.com/accounts/docs/OAuth2Login
+    """
+    data = {'access_token': access_token, 'alt': 'json'}
+    request = Request(url + '?' + urlencode(data))
+    try:
+        return simplejson.loads(urlopen(request).read())
+    except (ValueError, KeyError, IOError):
+        return None
+
+
+def validate_whitelists(backend, email):
+    """
+    Validates allowed domains and emails against the following settings:
+        GOOGLE_WHITE_LISTED_DOMAINS
+        GOOGLE_WHITE_LISTED_EMAILS
+
+    All domains and emails are allowed if setting is an empty list.
+    """
+    emails = setting('GOOGLE_WHITE_LISTED_EMAILS', [])
+    domains = setting('GOOGLE_WHITE_LISTED_DOMAINS', [])
+    if emails and email in emails:
+        return  # you're good
+    if domains and email.split('@', 1)[1] not in domains:
+        raise AuthFailed(backend, 'Domain not allowed')
 
 
 # Backend definition

@@ -15,6 +15,7 @@ implements a common interface to define new authentication providers from
 third parties.
 """
 
+
 def long_description():
     """Return long description from README.rst if it's present
     because it doesn't get installed."""
@@ -34,7 +35,8 @@ setup(name='django-social-auth',
       url='https://github.com/omab/django-social-auth',
       packages=['social_auth',
                 'social_auth.backends',
-                'social_auth.backends.contrib'],
+                'social_auth.backends.contrib',
+                'social_auth.backends.pipeline'],
       long_description=long_description(),
       install_requires=['django>=1.2.5',
                         'oauth2>=1.5.167',

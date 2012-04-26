@@ -9,12 +9,9 @@ Also the modules *must* define a BACKENDS dictionary with the backend name
 (which is used for URLs matching) and Auth class, otherwise it won't be
 enabled.
 """
-from os import walk
-from os.path import basename
-from uuid import uuid4
-from urllib2 import Request, urlopen
+from urllib2 import Request, urlopen, HTTPError
 from urllib import urlencode
-from httplib import HTTPSConnection
+from urlparse import urlsplit
 
 from openid.consumer.consumer import Consumer, SUCCESS, CANCEL, FAILURE
 from openid.consumer.discover import DiscoveryFailure
@@ -23,16 +20,25 @@ from openid.extensions import sreg, ax
 from oauth2 import Consumer as OAuthConsumer, Token, Request as OAuthRequest, \
                    SignatureMethod_HMAC_SHA1
 
-from django.conf import settings
-from django.core.exceptions import MultipleObjectsReturned
+from django.db import models
 from django.contrib.auth import authenticate
 from django.contrib.auth.backends import ModelBackend
 from django.utils import simplejson
 from django.utils.importlib import import_module
 
-from social_auth.models import UserSocialAuth
+from social_auth.utils import setting, log, model_to_ctype, ctype_to_model, \
+                              clean_partial_pipeline
 from social_auth.store import DjangoOpenIDStore
-from social_auth.signals import pre_update, socialauth_registered
+from social_auth.backends.exceptions import StopPipeline, AuthException, \
+                                            AuthFailed, AuthCanceled, \
+                                            AuthUnknownError, AuthTokenError, \
+                                            AuthMissingParameter
+
+
+if setting('SOCIAL_AUTH_USER_MODEL'):
+    User = models.get_model(*setting('SOCIAL_AUTH_USER_MODEL').rsplit('.', 1))
+else:
+    from django.contrib.auth.models import User
 
 
 # OpenID configuration
@@ -61,23 +67,16 @@ SESSION_NAME = 'openid'
 # key for username in user details dict used around, see get_user_details
 # method
 USERNAME = 'username'
-# get User class, could not be auth.User
-User = UserSocialAuth._meta.get_field('user').rel.to
-# username field max length
-USERNAME_MAX_LENGTH = User._meta.get_field(USERNAME).max_length
 
-# a few settings values
-def _setting(name, default=None):
-    return getattr(settings, name, default)
-
-CREATE_USERS = _setting('SOCIAL_AUTH_CREATE_USERS', True)
-ASSOCIATE_BY_MAIL = _setting('SOCIAL_AUTH_ASSOCIATE_BY_MAIL', False)
-LOAD_EXTRA_DATA = _setting('SOCIAL_AUTH_EXTRA_DATA', True)
-FORCE_RANDOM_USERNAME = _setting('SOCIAL_AUTH_FORCE_RANDOM_USERNAME', False)
-USERNAME_FIXER = _setting('SOCIAL_AUTH_USERNAME_FIXER', lambda u: u)
-DEFAULT_USERNAME = _setting('SOCIAL_AUTH_DEFAULT_USERNAME')
-CHANGE_SIGNAL_ONLY = _setting('SOCIAL_AUTH_CHANGE_SIGNAL_ONLY', False)
-UUID_LENGHT = _setting('SOCIAL_AUTH_UUID_LENGTH', 16)
+PIPELINE = setting('SOCIAL_AUTH_PIPELINE', (
+                'social_auth.backends.pipeline.social.social_auth_user',
+                'social_auth.backends.pipeline.associate.associate_by_email',
+                'social_auth.backends.pipeline.user.get_username',
+                'social_auth.backends.pipeline.user.create_user',
+                'social_auth.backends.pipeline.social.associate_user',
+                'social_auth.backends.pipeline.social.load_extra_data',
+                'social_auth.backends.pipeline.user.update_user_details',
+           ))
 
 
 class SocialAuthBackend(ModelBackend):
@@ -100,156 +99,61 @@ class SocialAuthBackend(ModelBackend):
             return None
 
         response = kwargs.get('response')
-        details = self.get_user_details(response)
-        uid = self.get_user_id(details, response)
-        is_new = False
-        user = kwargs.get('user')
+        pipeline = PIPELINE
+        kwargs = kwargs.copy()
+        kwargs['backend'] = self
 
-        try:
-            social_user = self.get_social_auth_user(uid)
-        except UserSocialAuth.DoesNotExist:
-            if user is None:  # new user
-                if not CREATE_USERS:
-                    return None
-
-                email = details.get('email')
-                if email and ASSOCIATE_BY_MAIL:
-                    # try to associate accounts registered with the same email
-                    # address, only if it's a single object. ValueError is
-                    # raised if multiple objects are returned
-                    try:
-                        user = User.objects.get(email=email)
-                    except MultipleObjectsReturned:
-                        raise ValueError('Not unique email address supplied')
-                    except User.DoesNotExist:
-                        user = None
-                if not user:
-                    username = self.username(details)
-                    user = User.objects.create_user(username=username,
-                                                    email=email)
-                    is_new = True
-            social_user = self.associate_auth(user, uid, response, details)
+        if 'pipeline_index' in kwargs:
+            pipeline = pipeline[kwargs['pipeline_index']:]
         else:
-            # This account was registered to another user, so we raise an
-            # error in such case and the view should decide what to do on
-            # at this moment, merging account is not an option because that
-            # would imply update user references on other apps, that's too
-            # much intrusive
-            if user and user != social_user.user:
-                raise ValueError('Account already in use.', social_user)
+            kwargs['details'] = self.get_user_details(response)
+            kwargs['uid'] = self.get_user_id(kwargs['details'], response)
+            kwargs['is_new'] = False
+
+        out = self.pipeline(pipeline, *args, **kwargs)
+        if not isinstance(out, dict):
+            return out
+
+        social_user = out.get('social_user')
+        if social_user:
+            # define user.social_user attribute to track current social
+            # account
             user = social_user.user
+            user.social_user = social_user
+            user.is_new = out.get('is_new')
+            return user
 
-        # Flag user "new" status
-        setattr(user, 'is_new', is_new)
+    def pipeline(self, pipeline, *args, **kwargs):
+        """Pipeline"""
+        out = kwargs.copy()
 
-        # Update extra_data storage, unless disabled by setting
-        if LOAD_EXTRA_DATA:
-            extra_data = self.extra_data(user, uid, response, details)
-            if extra_data and social_user.extra_data != extra_data:
-                social_user.extra_data = extra_data
-                social_user.save()
-
-        user.social_user = social_user
-
-        # Update user account data.
-        self.update_user_details(user, response, details, is_new)
-        return user
-
-    def username(self, details):
-        """Return an unique username, if SOCIAL_AUTH_FORCE_RANDOM_USERNAME
-        setting is True, then username will be a random USERNAME_MAX_LENGTH
-        chars uuid generated hash
-        """
-        def mk_uuid():
-            """Return hash from unique string"""
-            return uuid4().get_hex()
-
-        if FORCE_RANDOM_USERNAME:
-            username = mk_uuid()
-        elif details.get(USERNAME):
-            username = details[USERNAME]
-        elif DEFAULT_USERNAME:
-            username = DEFAULT_USERNAME
-            if callable(username):
-                username = username()
-        else:
-            username = mk_uuid()
-
-        short_username = username[:USERNAME_MAX_LENGTH - UUID_LENGHT]
-        final_username = None
-
-        while True:
-            final_username = USERNAME_FIXER(username)[:USERNAME_MAX_LENGTH]
-
+        for name in pipeline:
+            mod_name, func_name = name.rsplit('.', 1)
             try:
-                User.objects.get(username=final_username)
-            except User.DoesNotExist:
-                break
+                mod = import_module(mod_name)
+            except ImportError:
+                log('exception', 'Error importing pipeline %s', name)
             else:
-                # User with same username already exists, generate a unique
-                # username for current user using username as base but adding
-                # a unique hash at the end. Original username is cut to avoid
-                # the field max_length.
-                username = short_username + mk_uuid()[:UUID_LENGHT]
+                func = getattr(mod, func_name, None)
 
-        return final_username
+                if callable(func):
+                    try:
+                        result = func(*args, **out) or {}
+                    except StopPipeline:
+                        # Clean partial pipeline on stop
+                        if 'request' in kwargs:
+                            clean_partial_pipeline(kwargs['request'])
+                        break
 
-    def associate_auth(self, user, uid, response, details):
-        """Associate a Social Auth with an user account."""
-        return UserSocialAuth.objects.create(user=user, uid=uid,
-                                             provider=self.name)
+                    if isinstance(result, dict):
+                        out.update(result)
+                    else:
+                        return result
+        return out
 
     def extra_data(self, user, uid, response, details):
         """Return default blank user extra data"""
-        return ''
-
-    def update_user_details(self, user, response, details, is_new=False):
-        """Update user details with (maybe) new data. Username is not
-        changed if associating a new credential."""
-        changed = False  # flag to track changes
-
-        # check if values update should be left to signals handlers only
-        if not CHANGE_SIGNAL_ONLY:
-            for name, value in details.iteritems():
-                # do not update username, it was already generated by
-                # self.username(...) and loaded in given instance
-                if name != USERNAME and value and value != getattr(user, name,
-                                                                   value):
-                    setattr(user, name, value)
-                    changed = True
-
-        # Fire a pre-update signal sending current backend instance,
-        # user instance (created or retrieved from database), service
-        # response and processed details.
-        #
-        # Also fire socialauth_registered signal for newly registered
-        # users.
-        #
-        # Signal handlers must return True or False to signal instance
-        # changes. Send method returns a list of tuples with receiver
-        # and it's response.
-        signal_response = lambda (receiver, response): response
-
-        kwargs = {'sender': self.__class__, 'user': user,
-                  'response': response, 'details': details}
-        changed |= any(filter(signal_response, pre_update.send(**kwargs)))
-
-        # Fire socialauth_registered signal on new user registration
-        if is_new:
-            changed |= any(filter(signal_response,
-                                  socialauth_registered.send(**kwargs)))
-
-        if changed:
-            user.save()
-
-    def get_social_auth_user(self, uid):
-        """Return social auth user instance for given uid for current
-        backend.
-
-        Riase DoesNotExist exception if no entry.
-        """
-        return UserSocialAuth.objects.select_related('user')\
-                                     .get(provider=self.name, uid=uid)
+        return {}
 
     def get_user_id(self, details, response):
         """Must return a unique ID from values returned on details"""
@@ -265,8 +169,25 @@ class SocialAuthBackend(ModelBackend):
         """
         raise NotImplementedError('Implement in subclass')
 
+    @classmethod
+    def tokens(cls, instance):
+        """Return the tokens needed to authenticate the access to any API the
+        service might provide. The return value will be a dictionary with the
+        token type name as key and the token value.
+
+        instance must be a UserSocialAuth instance.
+        """
+        if instance.extra_data and 'access_token' in instance.extra_data:
+            return {
+                'access_token': instance.extra_data['access_token']
+            }
+        else:
+            return {}
+
     def get_user(self, user_id):
-        """Return user instance for @user_id"""
+        """
+        Return user with given ID from the User model used by this backend
+        """
         try:
             return User.objects.get(pk=user_id)
         except User.DoesNotExist:
@@ -297,7 +218,7 @@ class OAuthBackend(SocialAuthBackend):
         extra_data field"""
         data = {'access_token': response.get('access_token', '')}
         name = self.name.replace('-', '_').upper()
-        names = (self.EXTRA_DATA or []) + _setting(name + '_EXTRA_DATA', [])
+        names = (self.EXTRA_DATA or []) + setting(name + '_EXTRA_DATA', [])
         data.update((alias, response.get(name)) for name, alias in names)
         return data
 
@@ -305,15 +226,6 @@ class OAuthBackend(SocialAuthBackend):
 class OpenIDBackend(SocialAuthBackend):
     """Generic OpenID authentication backend"""
     name = 'openid'
-
-    def get_social_auth_user(self, uid):
-        """Return social auth user instance for given uid. OpenId uses
-        identity_url to identify the user in a unique way and that value
-        identifies the provider too.
-
-        Riase DoesNotExist exception if no entry.
-        """
-        return UserSocialAuth.objects.select_related('user').get(uid=uid)
 
     def get_user_id(self, details, response):
         """Return user unique id provided by service"""
@@ -339,9 +251,9 @@ class OpenIDBackend(SocialAuthBackend):
         if ax_names:
             resp = ax.FetchResponse.fromSuccessResponse(response)
             if resp:
-                values.update((alias.replace('old_', ''),
-                               resp.getSingle(src, ''))
-                                for src, alias in ax_names)
+                for src, alias in ax_names:
+                    name = alias.replace('old_', '')
+                    values[name] = resp.getSingle(src, '') or values.get(name)
         return values
 
     def get_user_details(self, response):
@@ -385,9 +297,9 @@ class OpenIDBackend(SocialAuthBackend):
         SREG_ATTR, OLD_AX_ATTRS or AX_SCHEMA_ATTRS
         """
         name = self.name.replace('-', '_').upper()
-        sreg_names = _setting(name + '_SREG_EXTRA_DATA')
-        ax_names = _setting(name + '_AX_EXTRA_DATA')
-        data = self.values_from_response(response, ax_names, sreg_names)
+        sreg_names = setting(name + '_SREG_EXTRA_DATA')
+        ax_names = setting(name + '_AX_EXTRA_DATA')
+        data = self.values_from_response(response, sreg_names, ax_names)
         return data
 
 
@@ -397,6 +309,7 @@ class BaseAuth(object):
 
         @AUTH_BACKEND   Authorization backend related with this service
     """
+
     AUTH_BACKEND = None
 
     def __init__(self, request, redirect):
@@ -417,6 +330,52 @@ class BaseAuth(object):
     def auth_complete(self, *args, **kwargs):
         """Completes loging process, must return user instance"""
         raise NotImplementedError('Implement in subclass')
+
+    def to_session_dict(self, next_idx, *args, **kwargs):
+        """Returns dict to store on session for partial pipeline."""
+        return {
+            'next': next_idx,
+            'backend': self.AUTH_BACKEND.name,
+            'args': tuple(map(model_to_ctype, args)),
+            'kwargs': dict((key, model_to_ctype(val))
+                                for key, val in kwargs.iteritems())
+        }
+
+    def from_session_dict(self, entry, *args, **kwargs):
+        """Takes session saved entry to continue pipeline and merges with
+        any new extra argument needed. Returns tuple with next pipeline
+        index entry, arguments and keyword arguments to continue the
+        process."""
+        args = args[:] + tuple(map(ctype_to_model, entry['args']))
+
+        kwargs = kwargs.copy()
+        kwargs.update((key, ctype_to_model(val))
+                            for key, val in entry['kwargs'].iteritems())
+        return (entry['next'], args, kwargs)
+
+    def continue_pipeline(self, *args, **kwargs):
+        """Continue previous halted pipeline"""
+        kwargs.update({
+            'auth': self,
+            self.AUTH_BACKEND.name: True
+        })
+        return authenticate(*args, **kwargs)
+
+    def request_token_extra_arguments(self):
+        """Return extra arguments needed on request-token process,
+        setting is per backend and defined by:
+            <backend name in uppercase>_REQUEST_TOKEN_EXTRA_ARGUMENTS.
+        """
+        backend_name = self.AUTH_BACKEND.name.upper().replace('-', '_')
+        return setting(backend_name + '_REQUEST_TOKEN_EXTRA_ARGUMENTS', {})
+
+    def auth_extra_arguments(self):
+        """Return extra arguments needed on auth process, setting is per
+        backend and defined by:
+            <backend name in uppercase>_AUTH_EXTRA_ARGUMENTS.
+        """
+        backend_name = self.AUTH_BACKEND.name.upper().replace('-', '_')
+        return setting(backend_name + '_AUTH_EXTRA_ARGUMENTS', {})
 
     @property
     def uses_redirect(self):
@@ -445,14 +404,14 @@ class OpenIdAuth(BaseAuth):
 
     def auth_url(self):
         """Return auth URL returned by service"""
-        openid_request = self.setup_request()
+        openid_request = self.setup_request(self.auth_extra_arguments())
         # Construct completion URL, including page we should redirect to
         return_to = self.request.build_absolute_uri(self.redirect)
         return openid_request.redirectURL(self.trust_root(), return_to)
 
     def auth_html(self):
         """Return auth HTML returned by service"""
-        openid_request = self.setup_request()
+        openid_request = self.setup_request(self.auth_extra_arguments())
         return_to = self.request.build_absolute_uri(self.redirect)
         form_tag = {'id': 'openid_message'}
         return openid_request.htmlMarkup(self.trust_root(), return_to,
@@ -460,30 +419,43 @@ class OpenIdAuth(BaseAuth):
 
     def trust_root(self):
         """Return trust-root option"""
-        return _setting('OPENID_TRUST_ROOT',
-                        self.request.build_absolute_uri('/'))
+        return setting('OPENID_TRUST_ROOT') or \
+               self.request.build_absolute_uri('/')
+
+    def continue_pipeline(self, *args, **kwargs):
+        """Continue previous halted pipeline"""
+        response = self.consumer().complete(dict(self.data.items()),
+                                            self.request.build_absolute_uri())
+        kwargs.update({
+            'auth': self,
+            'response': response,
+            self.AUTH_BACKEND.name: True
+        })
+        return authenticate(*args, **kwargs)
 
     def auth_complete(self, *args, **kwargs):
         """Complete auth process"""
         response = self.consumer().complete(dict(self.data.items()),
                                             self.request.build_absolute_uri())
         if not response:
-            raise ValueError('This is an OpenID relying party endpoint')
+            raise AuthException(self, 'OpenID relying party endpoint')
         elif response.status == SUCCESS:
-            kwargs.update({'response': response, self.AUTH_BACKEND.name: True})
+            kwargs.update({
+                'auth': self,
+                'response': response,
+                self.AUTH_BACKEND.name: True
+            })
             return authenticate(*args, **kwargs)
         elif response.status == FAILURE:
-            raise ValueError('OpenID authentication failed: %s' % \
-                             response.message)
+            raise AuthFailed(self, response.message)
         elif response.status == CANCEL:
-            raise ValueError('Authentication cancelled')
+            raise AuthCanceled(self)
         else:
-            raise ValueError('Unknown OpenID response type: %r' % \
-                             response.status)
+            raise AuthUnknownError(self, response.status)
 
-    def setup_request(self):
+    def setup_request(self, extra_params=None):
         """Setup request"""
-        openid_request = self.openid_request()
+        openid_request = self.openid_request(extra_params)
         # Request some user details. Use attribute exchange if provider
         # advertises support.
         if openid_request.endpoint.supportsType(ax.AXMessage.ns_uri):
@@ -508,29 +480,26 @@ class OpenIdAuth(BaseAuth):
         """Return true if openid request will be handled with redirect or
         HTML content will be returned.
         """
-        if not hasattr(self, '_uses_redirect'):
-            setattr(self, '_uses_redirect',
-                    self.openid_request().shouldSendRedirect())
-        return getattr(self, '_uses_redirect', True)
+        return self.openid_request().shouldSendRedirect()
 
-    def openid_request(self):
+    def openid_request(self, extra_params=None):
         """Return openid request"""
-        if not hasattr(self, '_openid_request'):
-            openid_url = self.openid_url()
-            try:
-                openid_request = self.consumer().begin(openid_url)
-            except DiscoveryFailure, err:
-                raise ValueError('OpenID discovery error: %s' % err)
-            else:
-                setattr(self, '_openid_request', openid_request)
-        return getattr(self, '_openid_request', None)
+        openid_url = self.openid_url()
+        if extra_params:
+            query = urlsplit(openid_url).query
+            openid_url += (query and '&' or '?') + urlencode(extra_params)
+
+        try:
+            return self.consumer().begin(openid_url)
+        except DiscoveryFailure, err:
+            raise AuthException(self, 'OpenID discovery error: %s' % err)
 
     def openid_url(self):
         """Return service provider URL.
         This base class is generic accepting a POST parameter that specifies
         provider URL."""
         if OPENID_ID_FIELD not in self.data:
-            raise ValueError('Missing openid identifier')
+            raise AuthMissingParameter(self, OPENID_ID_FIELD)
         return self.data[OPENID_ID_FIELD]
 
 
@@ -563,32 +532,51 @@ class ConsumerBasedOAuth(BaseOAuth):
         token = self.unauthorized_token()
         name = self.AUTH_BACKEND.name + 'unauthorized_token_name'
         self.request.session[name] = token.to_string()
-        return self.oauth_request(token, self.AUTHORIZATION_URL).to_url()
+        return self.oauth_authorization_request(token).to_url()
 
     def auth_complete(self, *args, **kwargs):
         """Return user, might be logged in"""
         name = self.AUTH_BACKEND.name + 'unauthorized_token_name'
         unauthed_token = self.request.session.get(name)
         if not unauthed_token:
-            raise ValueError('Missing unauthorized token')
+            raise AuthTokenError('Missing unauthorized token')
 
         token = Token.from_string(unauthed_token)
         if token.key != self.data.get('oauth_token', 'no-token'):
-            raise ValueError('Incorrect tokens')
+            raise AuthTokenError('Incorrect tokens')
 
-        access_token = self.access_token(token)
+        try:
+            access_token = self.access_token(token)
+        except HTTPError, e:
+            if e.code == 400:
+                raise AuthCanceled(self)
+            else:
+                raise
+
         data = self.user_data(access_token)
         if data is not None:
             data['access_token'] = access_token.to_string()
 
-        kwargs.update({'response': data, self.AUTH_BACKEND.name: True})
+        kwargs.update({
+            'auth': self,
+            'response': data,
+            self.AUTH_BACKEND.name: True
+        })
         return authenticate(*args, **kwargs)
 
     def unauthorized_token(self):
         """Return request for unauthorized token (first stage)"""
-        request = self.oauth_request(token=None, url=self.REQUEST_TOKEN_URL)
+        request = self.oauth_request(token=None, url=self.REQUEST_TOKEN_URL,
+                             extra_params=self.request_token_extra_arguments())
         response = self.fetch_response(request)
         return Token.from_string(response)
+
+    def oauth_authorization_request(self, token):
+        """Generate OAuth request to authorize token."""
+        return OAuthRequest.from_token_and_callback(token=token,
+                                        callback=self.redirect_uri,
+                                        http_url=self.AUTHORIZATION_URL,
+                                        parameters=self.auth_extra_arguments())
 
     def oauth_request(self, token, url, extra_params=None):
         """Generate OAuth request, setups callback url"""
@@ -607,9 +595,8 @@ class ConsumerBasedOAuth(BaseOAuth):
 
     def fetch_response(self, request):
         """Executes request and fetchs service response"""
-        connection = HTTPSConnection(self.SERVER_URL)
-        connection.request(request.method.upper(), request.to_url())
-        return connection.getresponse().read()
+        response = urlopen(request.to_url())
+        return '\n'.join(response.readlines())
 
     def access_token(self, token):
         """Return request for access token value"""
@@ -623,24 +610,20 @@ class ConsumerBasedOAuth(BaseOAuth):
     @property
     def consumer(self):
         """Setups consumer"""
-        consumer = getattr(self, '_consumer', None)
-        if consumer is None:
-            consumer = OAuthConsumer(*self.get_key_and_secret())
-            setattr(self, '_consumer', consumer)
-        return consumer
+        return OAuthConsumer(*self.get_key_and_secret())
 
     def get_key_and_secret(self):
         """Return tuple with Consumer Key and Consumer Secret for current
         service provider. Must return (key, secret), order *must* be respected.
         """
-        return _setting(self.SETTINGS_KEY_NAME), \
-               _setting(self.SETTINGS_SECRET_NAME)
+        return setting(self.SETTINGS_KEY_NAME), \
+               setting(self.SETTINGS_SECRET_NAME)
 
     @classmethod
     def enabled(cls):
         """Return backend enabled status by checking basic settings"""
-        return all(hasattr(settings, name) for name in
-                        (cls.SETTINGS_KEY_NAME, cls.SETTINGS_SECRET_NAME))
+        return setting(cls.SETTINGS_KEY_NAME) and \
+               setting(cls.SETTINGS_SECRET_NAME)
 
 
 class BaseOAuth2(BaseOAuth):
@@ -655,18 +638,29 @@ class BaseOAuth2(BaseOAuth):
     """
     AUTHORIZATION_URL = None
     ACCESS_TOKEN_URL = None
+    SCOPE_SEPARATOR = ' '
+    RESPONSE_TYPE = 'code'
 
     def auth_url(self):
         """Return redirect url"""
         client_id, client_secret = self.get_key_and_secret()
-        args = {'client_id': client_id,
-                'scope': ' '.join(self.get_scope()),
-                'redirect_uri': self.redirect_uri,
-                'response_type': 'code'}  # requesting code
+        args = {'client_id': client_id, 'redirect_uri': self.redirect_uri}
+
+        scope = self.get_scope()
+        if scope:
+            args['scope'] = self.SCOPE_SEPARATOR.join(self.get_scope())
+        if self.RESPONSE_TYPE:
+            args['response_type'] = self.RESPONSE_TYPE
+
+        args.update(self.auth_extra_arguments())
         return self.AUTHORIZATION_URL + '?' + urlencode(args)
 
     def auth_complete(self, *args, **kwargs):
         """Completes loging process, must return user instance"""
+        if self.data.get('error'):
+            error = self.data.get('error_description') or self.data['error']
+            raise AuthFailed(self, error)
+
         client_id, client_secret = self.get_key_and_secret()
         params = {'grant_type': 'authorization_code',  # request auth code
                   'code': self.data.get('code', ''),  # server response code
@@ -679,15 +673,24 @@ class BaseOAuth2(BaseOAuth):
 
         try:
             response = simplejson.loads(urlopen(request).read())
+        except HTTPError, e:
+            if e.code == 400:
+                raise AuthCanceled(self)
+            else:
+                raise
         except (ValueError, KeyError):
-            raise ValueError('Unknown OAuth2 response type')
+            raise AuthUnknownError(self)
 
         if response.get('error'):
             error = response.get('error_description') or response.get('error')
-            raise ValueError('OAuth2 authentication failed: %s' % error)
+            raise AuthFailed(self, error)
         else:
             response.update(self.user_data(response['access_token']) or {})
-            kwargs.update({'response': response, self.AUTH_BACKEND.name: True})
+            kwargs.update({
+                'auth': self,
+                'response': response,
+                self.AUTH_BACKEND.name: True
+            })
             return authenticate(*args, **kwargs)
 
     def get_scope(self):
@@ -698,42 +701,75 @@ class BaseOAuth2(BaseOAuth):
         """Return tuple with Consumer Key and Consumer Secret for current
         service provider. Must return (key, secret), order *must* be respected.
         """
-        return _setting(self.SETTINGS_KEY_NAME), \
-               _setting(self.SETTINGS_SECRET_NAME)
+        return setting(self.SETTINGS_KEY_NAME), \
+               setting(self.SETTINGS_SECRET_NAME)
 
 
-# import sources from where check for auth backends
-SOCIAL_AUTH_IMPORT_SOURCES = (
-    'social_auth.backends',
-    'social_auth.backends.contrib',
-) + _setting('SOCIAL_AUTH_IMPORT_BACKENDS', ())
+# Backend loading was previously performed via the
+# SOCIAL_AUTH_IMPORT_BACKENDS setting - as it's no longer used,
+# provide a deprecation warning.
+if setting('SOCIAL_AUTH_IMPORT_BACKENDS'):
+    from warnings import warn
+    warn("SOCIAL_AUTH_IMPORT_SOURCES is deprecated")
 
-def get_backends():
-    backends = {}
 
-    for mod_name in SOCIAL_AUTH_IMPORT_SOURCES:
-        try:
-            mod = import_module(mod_name)
-        except ImportError:
-            continue
+# Cache for discovered backends.
+BACKENDSCACHE = {}
 
-        for directory, subdir, files in walk(mod.__path__[0]):
-            for name in filter(lambda name: name.endswith('.py'), files):
-                try:
-                    name = basename(name).replace('.py', '')
-                    sub = import_module(mod_name + '.' + name)
-                    # register only enabled backends
-                    backends.update(((key, val)
-                                        for key, val in sub.BACKENDS.items()
-                                            if val.enabled()))
-                except (ImportError, AttributeError):
-                    pass
-    return backends
 
-# load backends from defined modules
-BACKENDS = get_backends()
-BACKENDS[OpenIdAuth.AUTH_BACKEND.name] = OpenIdAuth
+def get_backends(force_load=False):
+    """
+    Entry point to the BACKENDS cache. If BACKENDSCACHE hasn't been
+    populated, each of the modules referenced in
+    AUTHENTICATION_BACKENDS is imported and checked for a BACKENDS
+    definition and if enabled, added to the cache.
+
+    Previously all backends were attempted to be loaded at
+    import time of this module, which meant that backends that subclass
+    bases found in this module would not have the chance to be loaded
+    by the time they were added to this module's BACKENDS dict. See:
+    https://github.com/omab/django-social-auth/issues/204
+
+    This new approach ensures that backends are allowed to subclass from
+    bases in this module and still be picked up.
+
+    A force_load boolean arg is also provided so that get_backend
+    below can retry a requested backend that may not yet be discovered.
+    """
+    if not BACKENDSCACHE or force_load:
+        for auth_backend in setting('AUTHENTICATION_BACKENDS'):
+            mod, cls_name = auth_backend.rsplit('.', 1)
+            module = import_module(mod)
+            backend = getattr(module, cls_name)
+
+            if issubclass(backend, SocialAuthBackend):
+                name = backend.name
+                backends = getattr(module, 'BACKENDS', {})
+                if name in backends and backends[name].enabled():
+                    BACKENDSCACHE[name] = backends[name]
+    return BACKENDSCACHE
+
 
 def get_backend(name, *args, **kwargs):
-    """Return auth backend instance *if* it's registered, None in other case"""
-    return BACKENDS.get(name, lambda *args, **kwargs: None)(*args, **kwargs)
+    """Returns a backend by name. Backends are stored in the BACKENDSCACHE
+    cache dict. If not found, each of the modules referenced in
+    AUTHENTICATION_BACKENDS is imported and checked for a BACKENDS
+    definition. If the named backend is found in the module's BACKENDS
+    definition, it's then stored in the cache for future access.
+    """
+    try:
+        # Cached backend which has previously been discovered.
+        return BACKENDSCACHE[name](*args, **kwargs)
+    except KeyError:
+        # Force a reload of BACKENDS to ensure a missing
+        # backend hasn't been missed.
+        get_backends(force_load=True)
+        try:
+            return BACKENDSCACHE[name](*args, **kwargs)
+        except KeyError:
+            return None
+
+
+BACKENDS = {
+    'openid': OpenIdAuth
+}

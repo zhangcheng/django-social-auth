@@ -12,3 +12,6 @@ Contents:
    twitter
    facebook
    linkedin
+   github
+   browserid
+   instagram

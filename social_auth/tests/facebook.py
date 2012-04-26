@@ -1,18 +1,18 @@
 import re
 
-from django.conf import settings
-
+from social_auth.utils import setting
 from social_auth.tests.base import SocialAuthTestsCase, FormParserByID
 
 
 class FacebookTestCase(SocialAuthTestsCase):
     SERVER_NAME = 'myapp.com'
     SERVER_PORT = '8000'
+    name = 'facebook'
 
     def setUp(self, *args, **kwargs):
         super(FacebookTestCase, self).setUp(*args, **kwargs)
-        self.user = getattr(settings, 'TEST_FACEBOOK_USER', None)
-        self.passwd = getattr(settings, 'TEST_FACEBOOK_PASSWORD', None)
+        self.user = setting('TEST_FACEBOOK_USER')
+        self.passwd = setting('TEST_FACEBOOK_PASSWORD')
         # check that user and password are setup properly
         self.assertTrue(self.user)
         self.assertTrue(self.passwd)
@@ -20,9 +20,11 @@ class FacebookTestCase(SocialAuthTestsCase):
 
 REDIRECT_RE = re.compile('window.location.replace\("(.*)"\);')
 
+
 class FacebookTestLogin(FacebookTestCase):
     def test_login_succeful(self):
-        response = self.client.get(self.reverse('socialauth_begin', 'facebook'))
+        response = self.client.get(self.reverse('socialauth_begin',
+                                                'facebook'))
         # social_auth must redirect to service page
         self.assertEqual(response.status_code, 302)
 
